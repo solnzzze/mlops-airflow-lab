@@ -1,140 +1,84 @@
+from sklearn.preprocessing import StandardScaler
 import pandas as pd
-from sklearn.preprocessing import OrdinalEncoder
-from datetime import datetime, timedelta
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from train_model import train
+from sklearn.model_selection import train_test_split
+import mlflow
+import mlflow.sklearn
+from sklearn.linear_model import SGDRegressor
+import numpy as np
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from mlflow.models import infer_signature
+import joblib
 
-
-DATA_FILE = "csao_session_dataset.csv"
-CLEAR_FILE = "df_clear.csv"
 TARGET_COL = "final_order_value"
 
 
-def download_data():
-    df = pd.read_csv(DATA_FILE)
-    print("Dataset loaded:", df.shape)
-    print("Columns:", df.columns.tolist())
-    return True
+def scale_frame(frame):
+    df = frame.copy()
+
+    X = df.drop(columns=[TARGET_COL])
+    y = df[TARGET_COL]
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X.values)
+
+    return X_scaled, y.values, scaler
 
 
-def clear_data():
-    df = pd.read_csv(DATA_FILE)
-
-    drop_columns = [
-        "session_id",
-        "session_timestamp",
-        "user_id",
-        "restaurant_id",
-        "restaurant_name",
-        "base_cart_item_names",
-        "recommended_addon_names",
-        "actual_added_addon_names",
-    ]
-
-    cat_columns = [
-        "user_segment",
-        "user_city",
-        "user_preferred_cuisine",
-        "user_veg_preference",
-        "user_preferred_addon_category",
-        "restaurant_city",
-        "restaurant_cuisine",
-        "restaurant_type",
-        "restaurant_online_order",
-        "restaurant_price_tier",
-        "restaurant_is_chain",
-        "meal_time",
-        "is_weekend",
-        "has_offer",
-        "weather_condition",
-        "traffic_density",
-        "is_festival_day",
-        "delivery_zone",
-        "base_cart_item_categories",
-        "cart_has_drink",
-        "cart_has_dessert",
-        "cart_has_side",
-        "recommended_addon_categories",
-        "actual_added_addon_categories",
-        "any_addon_added",
-    ]
-
-    num_columns = [
-        "user_price_sensitivity",
-        "user_order_frequency_30d",
-        "user_avg_order_value",
-        "user_recency_days",
-        "num_past_orders_at_restaurant",
-        "user_addon_acceptance_rate",
-        "restaurant_rating",
-        "restaurant_delivery_time_avg",
-        "restaurant_avg_orders_per_day",
-        "hour",
-        "day_of_week",
-        "estimated_delivery_time",
-        "session_engagement_score",
-        "base_cart_item_count",
-        "base_cart_value",
-        "cart_completion_score",
-        "recommended_addon_prices",
-        "actual_added_addon_count",
-        "actual_added_addon_value",
-        "avg_reco_score",
-        "avg_reco_price_ratio",
-        "avg_reco_popularity",
-        "avg_reco_is_complementary",
-    ]
-
-    df = df.drop(columns=drop_columns, errors="ignore")
-
-    df = df.dropna(subset=[TARGET_COL])
-
-    for col in cat_columns:
-        if col in df.columns:
-            df[col] = df[col].fillna("missing").astype(str)
-
-    for col in num_columns + [TARGET_COL]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-            df[col] = df[col].fillna(df[col].median())
-
-    encoder = OrdinalEncoder()
-    existing_cat_columns = [col for col in cat_columns if col in df.columns]
-    df[existing_cat_columns] = encoder.fit_transform(df[existing_cat_columns])
-
-    df = df.reset_index(drop=True)
-    df.to_csv(CLEAR_FILE, index=False)
-
-    print("Clean dataset saved:", df.shape)
-    return True
+def eval_metrics(actual, pred):
+    rmse = np.sqrt(mean_squared_error(actual, pred))
+    mae = mean_absolute_error(actual, pred)
+    r2 = r2_score(actual, pred)
+    return rmse, mae, r2
 
 
-dag_zomato = DAG(
-    dag_id="train_zomato_pipe",
-    start_date=datetime(2025, 2, 3),
-    concurrency=4,
-    schedule_interval=timedelta(minutes=5),
-    max_active_runs=1,
-    catchup=False,
-)
+def train():
+    df = pd.read_csv("/home/mint/airflow/dags/df_clear.csv")
 
-download_task = PythonOperator(
-    python_callable=download_data,
-    task_id="download_zomato",
-    dag=dag_zomato
-)
+    X, y, scaler = scale_frame(df)
 
-clear_task = PythonOperator(
-    python_callable=clear_data,
-    task_id="clear_zomato",
-    dag=dag_zomato
-)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X,
+        y,
+        test_size=0.3,
+        random_state=42
+    )
 
-train_task = PythonOperator(
-    python_callable=train,
-    task_id="train_zomato",
-    dag=dag_zomato
-)
+    model = SGDRegressor(
+        random_state=42,
+        alpha=0.01,
+        l1_ratio=0.1,
+        penalty="elasticnet",
+        loss="squared_error",
+        fit_intercept=True,
+        max_iter=1000,
+        tol=1e-3
+    )
 
-download_task >> clear_task >> train_task
+    mlflow.set_experiment("zomato_final_order_value")
+
+    with mlflow.start_run():
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_val)
+
+        rmse, mae, r2 = eval_metrics(y_val, y_pred)
+
+        mlflow.log_param("alpha", model.alpha)
+        mlflow.log_param("l1_ratio", model.l1_ratio)
+        mlflow.log_param("penalty", model.penalty)
+        mlflow.log_param("loss", model.loss)
+        mlflow.log_param("fit_intercept", model.fit_intercept)
+
+        mlflow.log_metric("rmse", float(rmse))
+        mlflow.log_metric("mae", float(mae))
+        mlflow.log_metric("r2", float(r2))
+
+        signature = infer_signature(X_train, model.predict(X_train))
+        mlflow.sklearn.log_model(model, "model", signature=signature)
+
+        joblib.dump(model, "/home/mint/airflow/dags/zomato_model.pkl")
+        joblib.dump(scaler, "/home/mint/airflow/dags/zomato_scaler.pkl")
+
+        print("Training finished successfully")
+        print(f"RMSE: {rmse}")
+        print(f"MAE: {mae}")
+        print(f"R2: {r2}")
