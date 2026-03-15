@@ -1,95 +1,74 @@
-from sklearn.preprocessing import StandardScaler, PowerTransformer
 import pandas as pd
-from sklearn.model_selection import train_test_split, GridSearchCV
-import mlflow
-import mlflow.sklearn
-from sklearn.linear_model import SGDRegressor
-import numpy as np
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from mlflow.models import infer_signature
-import joblib
+from sklearn.preprocessing import OrdinalEncoder
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from train_model import train
 
-TARGET_COL = "final_order_value"
-
-
-def scale_frame(frame):
-    df = frame.copy()
-
-    X = df.drop(columns=[TARGET_COL])
-    y = df[TARGET_COL]
-
-    scaler = StandardScaler()
-    power_trans = PowerTransformer()
-
-    X_scaled = scaler.fit_transform(X.values)
-    y_scaled = power_trans.fit_transform(y.values.reshape(-1, 1))
-
-    return X_scaled, y_scaled, power_trans, scaler
+DATA_FILE = "Titanic-Dataset.csv"
+CLEAR_FILE = "df_clear.csv"
+TARGET_COL = "Survived"
 
 
-def eval_metrics(actual, pred):
-    rmse = np.sqrt(mean_squared_error(actual, pred))
-    mae = mean_absolute_error(actual, pred)
-    r2 = r2_score(actual, pred)
-    return rmse, mae, r2
+def download_data():
+    df = pd.read_csv(DATA_FILE)
+    print("df:", df.shape)
+    return True
 
 
-def train():
-    df = pd.read_csv("df_clear.csv")
+def clear_data():
+    df = pd.read_csv(DATA_FILE)
 
-    X, Y, power_trans, scaler = scale_frame(df)
+    cat_columns = ["Sex", "Embarked"]
+    num_columns = ["Pclass", "Age", "SibSp", "Parch", "Fare"]
 
-    X_train, X_val, y_train, y_val = train_test_split(
-        X,
-        Y,
-        test_size=0.3,
-        random_state=42
-    )
+    drop_columns = ["PassengerId", "Name", "Ticket", "Cabin"]
 
-    params = {
-        "alpha": [0.0001, 0.001, 0.01, 0.05, 0.1],
-        "l1_ratio": [0.001, 0.01, 0.05, 0.2],
-        "penalty": ["l1", "l2", "elasticnet"],
-        "loss": ["squared_error", "huber", "epsilon_insensitive"],
-        "fit_intercept": [False, True],
-    }
+    df = df.drop(columns=drop_columns, errors="ignore")
 
-    mlflow.set_experiment("zomato_final_order_value")
+    df = df.dropna(subset=[TARGET_COL])
 
-    with mlflow.start_run():
-        base_model = SGDRegressor(random_state=42)
-        clf = GridSearchCV(base_model, params, cv=3, n_jobs=4)
-        clf.fit(X_train, y_train.reshape(-1))
+    for col in cat_columns:
+        if col in df.columns:
+            df[col] = df[col].fillna("missing").astype(str)
 
-        best = clf.best_estimator_
+    for col in num_columns:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[col] = df[col].fillna(df[col].median())
 
-        y_pred = best.predict(X_val)
+    ordinal = OrdinalEncoder()
+    df[cat_columns] = ordinal.fit_transform(df[cat_columns])
 
-        y_pred_real = power_trans.inverse_transform(y_pred.reshape(-1, 1))
-        y_val_real = power_trans.inverse_transform(y_val)
+    df = df.reset_index(drop=True)
+    df.to_csv(CLEAR_FILE, index=False)
+    return True
 
-        rmse, mae, r2 = eval_metrics(y_val_real, y_pred_real)
 
-        mlflow.log_param("alpha", best.alpha)
-        mlflow.log_param("l1_ratio", best.l1_ratio)
-        mlflow.log_param("penalty", best.penalty)
-        mlflow.log_param("loss", best.loss)
-        mlflow.log_param("fit_intercept", best.fit_intercept)
-        mlflow.log_param("epsilon", best.epsilon)
+dag_titanic = DAG(
+    dag_id="train_titanic_pipe",
+    start_date=datetime(2025, 2, 3),
+    schedule=timedelta(minutes=5),
+    max_active_runs=1,
+    catchup=False,
+)
 
-        mlflow.log_metric("rmse", float(rmse))
-        mlflow.log_metric("mae", float(mae))
-        mlflow.log_metric("r2", float(r2))
+download_task = PythonOperator(
+    python_callable=download_data,
+    task_id="download_titanic",
+    dag=dag_titanic
+)
 
-        predictions = best.predict(X_train)
-        signature = infer_signature(X_train, predictions)
-        mlflow.sklearn.log_model(best, "model", signature=signature)
+clear_task = PythonOperator(
+    python_callable=clear_data,
+    task_id="clear_titanic",
+    dag=dag_titanic
+)
 
-        joblib.dump(best, "zomato_model.pkl")
-        joblib.dump(scaler, "zomato_scaler.pkl")
-        joblib.dump(power_trans, "zomato_power_transformer.pkl")
+train_task = PythonOperator(
+    python_callable=train,
+    task_id="train_titanic",
+    dag=dag_titanic
+)
 
-        print("Training finished successfully")
-        print(f"RMSE: {rmse}")
-        print(f"MAE: {mae}")
-        print(f"R2: {r2}")
+download_task >> clear_task >> train_task
